@@ -45,6 +45,74 @@
 smbios_hdl_t *ksmbios;
 int ksmbios_flags;
 
+static boolean_t
+smbios_validate_checksum(const void *buf, size_t len)
+{
+	const uint8_t *data = buf;
+	size_t offset;
+
+	uint_t sum = 0;
+	for (offset = 0; offset < len; offset++)
+		sum += data[offset];
+	sum &= 0xFF;
+
+	return (sum == 0);
+}
+
+static boolean_t
+smbios_validate_sm(void* sm, size_t remaining, smbios_entry_point_t *typep)
+{
+	const smbios_entry_t *entry = (const smbios_entry_t *)sm;
+	size_t len;
+
+	if (remaining >= SMB3_ENTRY_EANCHORLEN &&
+	    strncmp(sm, SMB3_ENTRY_EANCHOR, SMB3_ENTRY_EANCHORLEN) == 0) {
+		if (remaining < sizeof (smbios_30_entry_t))
+			return (B_FALSE);
+
+		len = entry->ep30.smbe_elen;
+		if (len < SMBIOS_30_ENTRY_MINLEN ||
+		    len > SMBIOS_30_ENTRY_MAXLEN || len > remaining)
+			return (B_FALSE);
+
+		if (!smbios_validate_checksum(sm, len))
+			return (B_FALSE);
+
+		*typep = SMBIOS_ENTRY_POINT_30;
+		return (B_TRUE);
+	}
+
+	if (remaining >= SMB_ENTRY_EANCHORLEN &&
+	    strncmp(sm, SMB_ENTRY_EANCHOR, SMB_ENTRY_EANCHORLEN) == 0) {
+		const size_t dmi_offset = offsetof(smbios_21_entry_t,
+		    smbe_ianchor);
+		const size_t dmi_len = sizeof (smbios_21_entry_t) - dmi_offset;
+
+		if (remaining < sizeof (smbios_21_entry_t))
+			return (B_FALSE);
+
+		if (strncmp(entry->ep21.smbe_ianchor, SMB_ENTRY_IANCHOR,
+		    SMB_ENTRY_IANCHORLEN) != 0)
+			return (B_FALSE);
+
+		len = entry->ep21.smbe_elen;
+		if (len < SMBIOS_21_ENTRY_MINLEN ||
+		    len > SMBIOS_21_ENTRY_MAXLEN || len > remaining)
+			return (B_FALSE);
+
+		if (!smbios_validate_checksum(sm, len))
+			return (B_FALSE);
+
+		if (!smbios_validate_checksum(sm + dmi_offset, dmi_len))
+			return (B_FALSE);
+
+		*typep = SMBIOS_ENTRY_POINT_21;
+		return (B_TRUE);
+	}
+
+	return (B_FALSE);
+}
+
 smbios_hdl_t *
 smb_open_error(smbios_hdl_t *shp, int *errp, int err)
 {
@@ -65,14 +133,15 @@ smbios_open(const char *file, int version, int flags, int *errp)
 {
 	smbios_hdl_t *shp = NULL;
 	smbios_entry_t *ep;
-	caddr_t stbuf, bios, p, q;
-	caddr_t smb2, smb3;
+	caddr_t stbuf, bios;
 	uint64_t startaddr, startoff = 0;
 	size_t bioslen;
 	uint_t smbe_stlen;
-	smbios_entry_point_t ep_type;
+	smbios_entry_point_t scan_type, ep_type;
 	uint8_t smbe_major, smbe_minor;
 	int err;
+	const smbios_21_entry_t *smb2 = NULL;
+	const smbios_30_entry_t *smb3 = NULL;
 
 	if (file != NULL || (flags & ~SMB_O_MASK))
 		return (smb_open_error(shp, errp, ESMB_INVAL));
@@ -91,9 +160,7 @@ smbios_open(const char *file, int version, int flags, int *errp)
 		if (bioslen - startoff <= startoff)
 			bioslen += MMU_PAGESIZE;
 	}
-
 	bios = psm_map_phys(startaddr, bioslen, PSM_PROT_READ);
-
 	if (bios == NULL)
 		return (smb_open_error(shp, errp, ESMB_MAPDEV));
 
@@ -101,19 +168,22 @@ smbios_open(const char *file, int version, int flags, int *errp)
 	 * In case we did map one page, make sure we will not cross
 	 * the end of the page.
 	 */
-	p = bios + startoff;
-	q = bios + bioslen - startoff;
-	smb2 = smb3 = NULL;
-	while (p < q) {
+	void* p = bios + startoff;
+	size_t end = bioslen - startoff;
+	for (size_t off = 0; off < end; off += SMB_SCAN_STEP) {
 		if (smb2 != NULL && smb3 != NULL)
 			break;
+		size_t left = end - off;
+		if (!smbios_validate_sm(p, left, &scan_type))
+			continue;
 
-		if (smb3 == NULL && strncmp(p, SMB3_ENTRY_EANCHOR,
-		    SMB3_ENTRY_EANCHORLEN) == 0) {
-			smb3 = p;
-		} else if (smb2 == NULL && strncmp(p, SMB_ENTRY_EANCHOR,
-		    SMB_ENTRY_EANCHORLEN) == 0) {
+		switch (scan_type) {
+		case SMBIOS_ENTRY_POINT_21:
 			smb2 = p;
+			break;
+		case SMBIOS_ENTRY_POINT_30:
+			smb3 = p;
+			break;
 		}
 
 		p += SMB_SCAN_STEP;
@@ -131,64 +201,52 @@ smbios_open(const char *file, int version, int flags, int *errp)
 	 * one with the newer version. If they're equivalent, we prefer the
 	 * 32-bit version. If only one is present, then we use that.
 	 */
-	ep = smb_alloc(SMB_ENTRY_MAXLEN);
 	if (smb2 != NULL && smb3 != NULL) {
 		uint8_t smb2maj, smb2min, smb3maj, smb3min;
 
-		bcopy(smb2, ep, sizeof (smbios_entry_t));
-		smb2maj = ep->ep21.smbe_major;
-		smb2min = ep->ep21.smbe_minor;
-		bcopy(smb3, ep, sizeof (smbios_entry_t));
-		smb3maj = ep->ep30.smbe_major;
-		smb3min = ep->ep30.smbe_minor;
+		smb2maj = smb2->smbe_major;
+		smb2min = smb2->smbe_minor;
+		smb3maj = smb3->smbe_major;
+		smb3min = smb3->smbe_minor;
 
 		if (smb3maj > smb2maj ||
 		    (smb3maj == smb2maj && smb3min > smb2min)) {
 			ep_type = SMBIOS_ENTRY_POINT_30;
-			p = smb3;
+			ep = (smbios_entry_t *)smb3;
 		} else {
 			ep_type = SMBIOS_ENTRY_POINT_21;
-			p = smb2;
+			ep = (smbios_entry_t *)smb2;
 		}
 	} else if (smb3 != NULL) {
 		ep_type = SMBIOS_ENTRY_POINT_30;
-		p = smb3;
+		ep = (smbios_entry_t *)smb3;
 	} else {
 		ep_type = SMBIOS_ENTRY_POINT_21;
-		p = smb2;
-	}
-	bcopy(p, ep, sizeof (smbios_entry_t));
-	if (ep_type == SMBIOS_ENTRY_POINT_21) {
-		ep->ep21.smbe_elen = MIN(ep->ep21.smbe_elen, SMB_ENTRY_MAXLEN);
-		bcopy(p, ep, ep->ep21.smbe_elen);
-	} else if (ep_type == SMBIOS_ENTRY_POINT_30) {
-		ep->ep30.smbe_elen = MIN(ep->ep30.smbe_elen, SMB_ENTRY_MAXLEN);
-		bcopy(p, ep, ep->ep30.smbe_elen);
+		ep = (smbios_entry_t *)smb2;
 	}
 
 	psm_unmap_phys(bios, bioslen);
+
 	switch (ep_type) {
 	case SMBIOS_ENTRY_POINT_21:
-		smbe_major = ep->ep21.smbe_major;
-		smbe_minor = ep->ep21.smbe_minor;
-		smbe_stlen = ep->ep21.smbe_stlen;
-		bios = psm_map_phys(ep->ep21.smbe_staddr, smbe_stlen,
+		smbe_major = smb2->smbe_major;
+		smbe_minor = smb2->smbe_minor;
+		smbe_stlen = smb2->smbe_stlen;
+		bios = psm_map_phys(smb2->smbe_staddr, smbe_stlen,
 		    PSM_PROT_READ);
 		break;
 	case SMBIOS_ENTRY_POINT_30:
-		smbe_major = ep->ep30.smbe_major;
-		smbe_minor = ep->ep30.smbe_minor;
-		smbe_stlen = ep->ep30.smbe_stlen;
-		bios = psm_map_phys_new(ep->ep30.smbe_staddr, smbe_stlen,
+		smbe_major = smb3->smbe_major;
+		smbe_minor = smb3->smbe_minor;
+		smbe_stlen = smb3->smbe_stlen;
+		bios = psm_map_phys_new(smb3->smbe_staddr, smbe_stlen,
 		    PSM_PROT_READ);
 		break;
 	default:
-		smb_free(ep, SMB_ENTRY_MAXLEN);
 		return (smb_open_error(shp, errp, ESMB_VERSION));
 	}
 
 	if (bios == NULL) {
-		smb_free(ep, SMB_ENTRY_MAXLEN);
 		return (smb_open_error(shp, errp, ESMB_MAPDEV));
 	}
 
@@ -199,7 +257,6 @@ smbios_open(const char *file, int version, int flags, int *errp)
 
 	if (shp == NULL) {
 		smb_free(stbuf, smbe_stlen);
-		smb_free(ep, SMB_ENTRY_MAXLEN);
 		return (smb_open_error(shp, errp, err));
 	}
 
@@ -211,8 +268,6 @@ smbios_open(const char *file, int version, int flags, int *errp)
 	}
 
 	shp->sh_flags |= SMB_FL_BUFALLOC;
-	smb_free(ep, SMB_ENTRY_MAXLEN);
-
 	return (shp);
 }
 
