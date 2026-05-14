@@ -23,6 +23,7 @@
  * Copyright 2015 OmniTI Computer Consulting, Inc. All rights reserved.
  * Copyright (c) 2018, Joyent, Inc.
  * Copyright 2025 Oxide Computer Company
+ * Copyright 2026 Omar Roth
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
@@ -107,6 +108,15 @@ typedef union {
 #define	SMB_ENTRY_IANCHOR	"_DMI_"	/* intermediate anchor string */
 #define	SMB_ENTRY_IANCHORLEN	5	/* length of intermediate anchor */
 #define	SMB_ENTRY_MAXLEN	255	/* maximum length of entry point */
+
+/*
+ * SMBIOS 2.x entry points are 31 bytes, with 30 tolerated from a
+ * SMBIOS 2.1 specification mistake and 32 for rounded-up firmware entries.
+ */
+#define	SMBIOS_21_ENTRY_MINLEN	30
+#define	SMBIOS_21_ENTRY_MAXLEN	32
+#define	SMBIOS_30_ENTRY_MINLEN	(sizeof (smbios_30_entry_t))
+#define	SMBIOS_30_ENTRY_MAXLEN	32
 
 /*
  * Structure type codes.  The comments next to each type include an (R) note to
